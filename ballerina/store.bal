@@ -62,14 +62,14 @@ public isolated class ShortTermMemoryStore {
 
     # Initializes the PostgreSQL-backed short-term memory store.
     #
-    # + postgresqlClient - The PostgreSQL client or database configuration to connect to the database
+    # + dbConnection - The PostgreSQL client or database configuration to connect to the database
     # + maxMessagesPerKey - The maximum number of interactive messages to store per key
     # + cacheConfig - The cache configuration for in-memory caching of messages
     # + tableName - The name of the database table to store chat messages (default: "chat_messages").
     # Must start with a letter or underscore and contain only letters, digits, and underscores.
     # Note that PostgreSQL folds unquoted identifiers to lower case.
     # + return - An error if the initialization fails
-    public isolated function init(postgresql:Client|DatabaseConfiguration postgresqlClient,
+    public isolated function init(postgresql:Client|DatabaseConfiguration dbConnection,
             int maxMessagesPerKey = 20,
             cache:CacheConfig? cacheConfig = (),
             string tableName = "chat_messages") returns Error? {
@@ -83,18 +83,18 @@ public isolated class ShortTermMemoryStore {
                 + " It must be a positive integer.");
         }
         self.tableName = tableName;
-        if postgresqlClient is postgresql:Client {
-            self.dbClient = postgresqlClient;
+        if dbConnection is postgresql:Client {
+            self.dbClient = dbConnection;
             self.ownsDbClient = false;
         } else {
             postgresql:Client|sql:Error initializedClient = new postgresql:Client(
-                host = postgresqlClient.host,
-                username = postgresqlClient.username,
-                password = postgresqlClient.password,
-                database = postgresqlClient.database,
-                port = postgresqlClient.port,
-                options = postgresqlClient.options,
-                connectionPool = postgresqlClient.connectionPool
+                host = dbConnection.host,
+                username = dbConnection.username,
+                password = dbConnection.password,
+                database = dbConnection.database,
+                port = dbConnection.port,
+                options = dbConnection.options,
+                connectionPool = dbConnection.connectionPool
             );
             if initializedClient is sql:Error {
                 return error("Failed to create PostgreSQL client: " + initializedClient.message(), initializedClient);

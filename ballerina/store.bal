@@ -31,7 +31,7 @@ public type DatabaseConfiguration record {|
     # Database host
     string host = "localhost";
     # Database user
-    string user = "postgres";
+    string username = "postgres";
     # Database password
     string password?;
     # Database name
@@ -57,8 +57,7 @@ public isolated class ShortTermMemoryStore {
     private final cache:Cache? cache;
     private final int maxMessagesPerKey;
     private final string tableName;
-    // `true` only if the PostgreSQL client was created internally (from a `DatabaseConfiguration`),
-    // in which case this store owns it and closes it via `close()`.
+    // `true` only if the PostgreSQL client was created internally.
     private final boolean ownsDbClient;
 
     # Initializes the PostgreSQL-backed short-term memory store.
@@ -90,7 +89,7 @@ public isolated class ShortTermMemoryStore {
         } else {
             postgresql:Client|sql:Error initializedClient = new postgresql:Client(
                 host = postgresqlClient.host,
-                username = postgresqlClient.user,
+                username = postgresqlClient.username,
                 password = postgresqlClient.password,
                 database = postgresqlClient.database,
                 port = postgresqlClient.port,
@@ -172,16 +171,12 @@ public isolated class ShortTermMemoryStore {
             }
         }
 
-        do {
-            final var allMessages = check self.cacheFromDatabase(key);
-            if allMessages is readonly & ai:ChatInteractiveMessage[] {
-                return allMessages;
-            }
-            var [_, ...interactiveMessages] = allMessages;
-            return interactiveMessages;
-        } on fail Error err {
-            return error("Failed to retrieve chat messages: " + err.message(), err);
+        final var allMessages = check self.cacheFromDatabase(key);
+        if allMessages is readonly & ai:ChatInteractiveMessage[] {
+            return allMessages;
         }
+        var [_, ...interactiveMessages] = allMessages;
+        return interactiveMessages;
     }
 
     # Retrieves all stored chat messages for a given key.
@@ -201,12 +196,7 @@ public isolated class ShortTermMemoryStore {
             }
         }
 
-        do {
-            final var allMessages = check self.cacheFromDatabase(key);
-            return allMessages;
-        } on fail Error err {
-            return error("Failed to retrieve chat messages: " + err.message(), err);
-        }
+        return self.cacheFromDatabase(key);
     }
 
     # Adds one or more chat messages to the memory store for a given key.
@@ -427,11 +417,27 @@ public isolated class ShortTermMemoryStore {
     # + key - The key associated with the memory
     # + return - true if the memory store is full, false otherwise, or an `Error` error if the operation fails
     public isolated function isFull(string key) returns boolean|Error {
-        ai:ChatInteractiveMessage[]|Error interactiveMessages = self.getChatInteractiveMessages(key);
-        if interactiveMessages is Error {
-            return interactiveMessages;
+        lock {
+            CachedMessages? cacheEntry = self.getCacheEntry(key);
+            if cacheEntry is CachedMessages {
+                return cacheEntry.interactiveMessages.length() >= self.maxMessagesPerKey;
+            }
         }
-        return interactiveMessages.length() >= self.maxMessagesPerKey;
+
+        // On a cache miss, the interactive-message count is obtained via `COUNT(*)` rather than by
+        // loading and deserializing every message, since only the count is needed here.
+        record {|int count;|}|sql:Error countResult = self.dbClient->queryRow(
+            replaceTableNamePlaceholder(`
+                SELECT COUNT(*) AS count
+                FROM $_tableName_$
+                WHERE message_key = ${key} AND message_role != 'system'`,
+                self.tableName
+            )
+        );
+        if countResult is sql:Error {
+            return error("Failed to check if the memory store is full: " + countResult.message(), countResult);
+        }
+        return countResult.count >= self.maxMessagesPerKey;
     }
 
     private isolated function initializeDatabase() returns Error? {

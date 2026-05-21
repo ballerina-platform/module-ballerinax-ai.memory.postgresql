@@ -492,12 +492,14 @@ isolated function assertChatMessageEquals(ai:ChatMessage actual, ai:ChatMessage 
         test:assertEquals(actual.role, expected.role);
         test:assertEquals(actual.name, expected.name);
         test:assertEquals(actual.id, expected.id);
+        test:assertEquals(actual.content, expected.content);
         return;
     }
 
     if actual is ai:ChatAssistantMessage && expected is ai:ChatAssistantMessage {
         test:assertEquals(actual.role, expected.role);
         test:assertEquals(actual.name, expected.name);
+        test:assertEquals(actual.content, expected.content);
         test:assertEquals(actual.toolCalls, expected.toolCalls);
         return;
     }
@@ -887,7 +889,7 @@ function dropCustomTable() returns error? {
 function testDatabaseConfigurationConstructor() returns error? {
     DatabaseConfiguration config = {
         host: DB_HOST,
-        user: DB_USER,
+        username: DB_USER,
         password: DB_PASSWORD,
         database: DB_NAME
     };
@@ -902,6 +904,7 @@ function testDatabaseConfigurationConstructor() returns error? {
     check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2]);
 }
 
+@test:Config {}
 function testInvalidTableName() {
     postgresql:Client cl = getClient();
     ShortTermMemoryStore|Error store = new (cl, tableName = "invalid-table-name");
@@ -911,6 +914,7 @@ function testInvalidTableName() {
     test:assertTrue(store.message().includes("Invalid table name"));
 }
 
+@test:Config {}
 function testInvalidMaxMessagesPerKey() {
     postgresql:Client cl = getClient();
     ShortTermMemoryStore|Error store = new (cl, 0);
@@ -1036,6 +1040,33 @@ function testAssistantMessageWithToolCalls() returns error? {
     ai:ChatInteractiveMessage[] messages = check store.getChatInteractiveMessages(K1);
     test:assertEquals(messages.length(), 1);
     assertChatMessageEquals(messages[0], assistantMessage);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testAssistantAndFunctionMessageContent() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    ai:ChatAssistantMessage assistantMessage = {
+        role: ai:ASSISTANT,
+        content: "Sure, let me check the weather in Seattle for you.",
+        name: "weatherBot"
+    };
+    ai:ChatFunctionMessage functionMessage = {
+        role: "function",
+        name: "getWeather",
+        id: "call_1",
+        content: "{\"temperature\": 58, \"condition\": \"cloudy\"}"
+    };
+
+    check store.put(K1, assistantMessage);
+    check store.put(K1, functionMessage);
+
+    // The non-nil `content` of both message kinds must survive the database round-trip.
+    check assertInteractiveMessages(store, K1, [assistantMessage, functionMessage]);
+    check assertFromDatabase(cl, K1, [assistantMessage, functionMessage], INTERACTIVE);
 }
 
 @test:Config {

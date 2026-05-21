@@ -19,6 +19,7 @@ import ballerina/cache;
 import ballerina/sql;
 import ballerinax/postgresql;
 import ballerinax/postgresql.driver as _;
+import ballerina/lang.regexp;
 
 final string:RegExp & readonly TABLE_NAME_REGEX = re `^[A-Za-z_][A-Za-z0-9_]*$`;
 

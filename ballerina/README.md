@@ -5,7 +5,7 @@ This module provides a PostgreSQL-backed short-term memory store to use with AI 
 ### Key Features
 
 - PostgreSQL-backed persistent storage for short-term AI message memory
-- Configurable per-key capacity, surfaced via `getCapacity()` and `isFull()` for the `ai:ShortTermMemory` overflow handler to manage trimming
+- Configurable maximum messages per key with automatic eviction
 - Built-in in-memory caching for improved read performance
 - Support for both direct database configuration and existing PostgreSQL client reuse
 
@@ -39,12 +39,12 @@ import ballerinax/postgresql;
     import ballerinax/ai.memory.postgresql;
 
     configurable string host = ?;
-    configurable string username = ?;
+    configurable string user = ?;
     configurable string password = ?;
     configurable string database = ?;
 
     ai:ShortTermMemoryStore store = check new postgresql:ShortTermMemoryStore({
-        host, username, password, database
+        host, user, password, database
     });
     ```
 
@@ -56,21 +56,19 @@ import ballerinax/postgresql;
     import ballerinax/ai.memory.postgresql as postgresqlStore;
 
     configurable string host = ?;
-    configurable string username = ?;
+    configurable string user = ?;
     configurable string password = ?;
     configurable string database = ?;
 
-    postgresql:Client postgresqlClient = check new (host = host, username = username, password = password, database = database);
+    postgresql:Client postgresqlClient = check new (host = host, username = user, password = password, database = database);
     ai:ShortTermMemoryStore store = check new postgresqlStore:ShortTermMemoryStore(postgresqlClient);
     ```
 
-    Optionally, specify the per-key message capacity (`maxMessagesPerKey` - defaults to `20`), the configuration for the in-memory cache for messages (`cacheConfig` - defaults to no cache), and/or the table name (`tableName` - defaults to `"chat_messages"`).
-
-    > **Note**: `maxMessagesPerKey` is an advisory capacity reported via `getCapacity()`/`isFull()`. The store does not reject messages that exceed it; trimming is performed by the `ai:ShortTermMemory` overflow handler.
+    Optionally, specify the maximum number of messages to store per key (`maxMessagesPerKey` - defaults to `20`), the configuration for the in-memory cache for messages (`cacheConfig` - defaults to no cache), and/or the table name (`tableName` - defaults to `"chat_messages"`).
 
     ```ballerina
     ai:ShortTermMemoryStore store = check new postgresql:ShortTermMemoryStore({
-        host, username, password, database
+        host, user, password, database
     }, 10, {capacity: 10});
     ```
 
@@ -89,13 +87,11 @@ CREATE TABLE chat_messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX chat_messages_key_id_idx
-    ON chat_messages (message_key, id);
+CREATE INDEX chat_messages_key_created_idx
+    ON chat_messages (message_key, created_at);
 
 CREATE UNIQUE INDEX chat_messages_system_uidx
     ON chat_messages (message_key) WHERE message_role = 'system';
 ```
-
-Messages are ordered by the monotonically-increasing `id` column. The `created_at` column is identical for all rows inserted within a single transaction (such as a batch insert from `put` with multiple messages), so it cannot be relied on for ordering; `id` is used instead.
 
 The partial unique index enforces the "at most one system message per key" invariant and powers the upsert via `INSERT … ON CONFLICT … DO UPDATE`.

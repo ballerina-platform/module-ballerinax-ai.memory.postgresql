@@ -38,12 +38,12 @@ import ballerinax/postgresql;
     import ballerinax/ai.memory.postgresql;
 
     configurable string host = ?;
-    configurable string username = ?;
+    configurable string user = ?;
     configurable string password = ?;
     configurable string database = ?;
 
     ai:ShortTermMemoryStore store = check new postgresql:ShortTermMemoryStore({
-        host, username, password, database
+        host, user, password, database
     });
     ```
 
@@ -55,25 +55,27 @@ import ballerinax/postgresql;
     import ballerinax/ai.memory.postgresql as postgresqlStore;
 
     configurable string host = ?;
-    configurable string username = ?;
+    configurable string user = ?;
     configurable string password = ?;
     configurable string database = ?;
 
-    postgresql:Client postgresqlClient = check new (host = host, username = username, password = password, database = database);
+    postgresql:Client postgresqlClient = check new (host = host, username = user, password = password, database = database);
     ai:ShortTermMemoryStore store = check new postgresqlStore:ShortTermMemoryStore(postgresqlClient);
     ```
 
-    Optionally, specify the per-key message capacity (`maxMessagesPerKey` - defaults to `20`), the configuration for the in-memory cache for messages (`cacheConfig` - defaults to no cache), and/or the table name (`tableName` - defaults to `"chat_messages"`).
-
-    > **Note**: `maxMessagesPerKey` is an advisory capacity reported via `getCapacity()`/`isFull()`. The store does not reject messages that exceed it; trimming is performed by the `ai:ShortTermMemory` overflow handler.
+    Optionally, specify the maximum number of messages to store per key (`maxMessagesPerKey` - defaults to `20`), the configuration for the in-memory cache for messages (`cacheConfig` - defaults to no cache), and/or the table name (`tableName` - defaults to `"chat_messages"`).
 
     ```ballerina
     ai:ShortTermMemoryStore store = check new postgresql:ShortTermMemoryStore({
-        host, username, password, database
+        host, user, password, database
     }, 10, {capacity: 10});
     ```
 
 > **Note on table naming**: PostgreSQL folds unquoted identifiers to lower case. The default table name `chat_messages` keeps the connector free of identifier-quoting concerns. The `tableName` argument is validated against `^[A-Za-z_][A-Za-z0-9_]*$` and inlined unquoted into SQL — so any upper-case characters in the supplied name will be lowercased by PostgreSQL.
+
+## Examples
+
+A runnable example wiring this store into an AI agent is available at [`examples/chat-memory-with-agent`](./examples/chat-memory-with-agent).
 
 ## Build from the source
 

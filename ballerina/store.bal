@@ -26,8 +26,6 @@ final string:RegExp & readonly TABLE_NAME_REGEX = re `^[A-Za-z_][A-Za-z0-9_]*$`;
 # Represents a distinct error type for memory store errors.
 public type Error distinct ai:MemoryError;
 
-type ExceedsSizeError distinct Error;
-
 # Database configuration for the PostgreSQL client.
 public type DatabaseConfiguration record {|
     # Database host
@@ -59,6 +57,9 @@ public isolated class ShortTermMemoryStore {
     private final cache:Cache? cache;
     private final int maxMessagesPerKey;
     private final string tableName;
+    // `true` only if the PostgreSQL client was created internally (from a `DatabaseConfiguration`),
+    // in which case this store owns it and closes it via `close()`.
+    private final boolean ownsDbClient;
 
     # Initializes the PostgreSQL-backed short-term memory store.
     #
@@ -68,7 +69,7 @@ public isolated class ShortTermMemoryStore {
     # + tableName - The name of the database table to store chat messages (default: "chat_messages").
     # Must start with a letter or underscore and contain only letters, digits, and underscores.
     # Note that PostgreSQL folds unquoted identifiers to lower case.
-    # + returns - An error if the initialization fails
+    # + return - An error if the initialization fails
     public isolated function init(postgresql:Client|DatabaseConfiguration postgresqlClient,
             int maxMessagesPerKey = 20,
             cache:CacheConfig? cacheConfig = (),
@@ -78,9 +79,14 @@ public isolated class ShortTermMemoryStore {
                 + " Table name must start with a letter or underscore, "
                 + "and can only contain letters, digits, and underscores.");
         }
+        if maxMessagesPerKey < 1 {
+            return error(string `Invalid 'maxMessagesPerKey': ${maxMessagesPerKey}.`
+                + " It must be a positive integer.");
+        }
         self.tableName = tableName;
         if postgresqlClient is postgresql:Client {
             self.dbClient = postgresqlClient;
+            self.ownsDbClient = false;
         } else {
             postgresql:Client|sql:Error initializedClient = new postgresql:Client(
                 host = postgresqlClient.host,
@@ -95,10 +101,22 @@ public isolated class ShortTermMemoryStore {
                 return error("Failed to create PostgreSQL client: " + initializedClient.message(), initializedClient);
             }
             self.dbClient = initializedClient;
+            self.ownsDbClient = true;
         }
         self.maxMessagesPerKey = maxMessagesPerKey;
         self.cache = cacheConfig is () ? () : new (cacheConfig);
-        return self.initializeDatabase();
+
+        Error? initResult = self.initializeDatabase();
+        if initResult is Error {
+            // Avoid leaking the connection pool of an internally-created client on init failure.
+            if self.ownsDbClient {
+                sql:Error? closeResult = self.dbClient.close();
+                if closeResult is sql:Error {
+                    // Ignore: surface the original initialization error instead.
+                }
+            }
+            return initResult;
+        }
     }
 
     # Retrieves the system message, if it was provided, for a given key.
@@ -118,8 +136,7 @@ public isolated class ShortTermMemoryStore {
             replaceTableNamePlaceholder(`
                 SELECT message_json
                 FROM $_tableName_$
-                WHERE message_key = ${key} AND message_role = 'system'
-                ORDER BY created_at ASC`,
+                WHERE message_key = ${key} AND message_role = 'system'`,
                 self.tableName
             )
         );
@@ -242,35 +259,29 @@ public isolated class ShortTermMemoryStore {
 
         final var [newSystemMessages, newInteractiveMessages] = partitionMessagesByType(messages);
         final readonly & ai:ChatSystemMessage? finalChatSystemMessage = getLatestSystemMessage(newSystemMessages);
-        if finalChatSystemMessage is ai:ChatSystemMessage {
-            ChatMessageDatabaseMessage dbMessage = transformToDatabaseMessage(finalChatSystemMessage);
-            sql:ExecutionResult|sql:Error upsertResult = self.updateSystemMessage(key, dbMessage);
-            if upsertResult is sql:Error {
-                return error("Failed to upsert system message: " + upsertResult.message(), upsertResult);
-            }
-        }
 
-        // Insert interactive messages in batch
-        if newInteractiveMessages.length() > 0 {
-            ai:ChatInteractiveMessage[] oldInteractiveMesssages = check self.getChatInteractiveMessages(key);
-            int currentCount = oldInteractiveMesssages.length();
-            int incoming = newInteractiveMessages.length();
+        sql:ParameterizedQuery[] insertQueries = from ai:ChatInteractiveMessage msg in newInteractiveMessages
+            let ChatMessageDatabaseMessage dbMsg = transformToDatabaseMessage(msg)
+            select replaceTableNamePlaceholder(`
+                    INSERT INTO $_tableName_$ (message_key, message_role, message_json)
+                    VALUES (${key}, ${dbMsg.role}, ${dbMsg.toJsonString()})`,
+                    self.tableName
+                );
 
-            if currentCount + incoming > self.maxMessagesPerKey {
-                return error(string `Cannot add more messages.`
-                    + string ` Maximum limit '${self.maxMessagesPerKey}' exceeded for key '${key}'`);
+        // The system-message upsert and the interactive-message batch insert are wrapped in a single
+        // transaction so the store is never left in a partially-updated state on failure.
+        do {
+            transaction {
+                if finalChatSystemMessage is ai:ChatSystemMessage {
+                    _ = check self.updateSystemMessage(key, transformToDatabaseMessage(finalChatSystemMessage));
+                }
+                if insertQueries.length() > 0 {
+                    _ = check self.dbClient->batchExecute(insertQueries);
+                }
+                check commit;
             }
-            sql:ParameterizedQuery[] insertQueries = from ai:ChatInteractiveMessage msg in newInteractiveMessages
-                let ChatMessageDatabaseMessage dbMsg = transformToDatabaseMessage(msg)
-                select replaceTableNamePlaceholder(`
-                        INSERT INTO $_tableName_$ (message_key, message_role, message_json)
-                        VALUES (${key}, ${msg.role}, ${dbMsg.toJsonString()})`,
-                        self.tableName
-                    );
-            sql:ExecutionResult[]|sql:Error batchResult = self.dbClient->batchExecute(insertQueries);
-            if batchResult is sql:Error {
-                return error("Failed batch insert of interactive messages: " + batchResult.message(), batchResult);
-            }
+        } on fail error err {
+            return error("Failed to add chat messages: " + err.message(), err);
         }
 
         final ai:ChatInteractiveMessage[] & readonly immutableInteractiveMessages = from ai:ChatInteractiveMessage message
@@ -343,6 +354,9 @@ public isolated class ShortTermMemoryStore {
     # if not provided, removes all messages
     # + return - nil on success, or an `Error` error if the operation fails
     public isolated function removeChatInteractiveMessages(string key, int? count = ()) returns Error? {
+        if count is int && count <= 0 {
+            return error(string `Invalid 'count': ${count}. It must be nil or a positive integer.`);
+        }
         if count is () {
             sql:ExecutionResult|sql:Error result = self.dbClient->execute(
                 replaceTableNamePlaceholder(`
@@ -363,7 +377,7 @@ public isolated class ShortTermMemoryStore {
                         SELECT id
                         FROM $_tableName_$
                         WHERE message_key = ${key} AND message_role != 'system'
-                        ORDER BY created_at ASC
+                        ORDER BY id ASC
                         LIMIT ${count}
                     )`, self.tableName
                 )
@@ -414,15 +428,9 @@ public isolated class ShortTermMemoryStore {
     # + return - true if the memory store is full, false otherwise, or an `Error` error if the operation fails
     public isolated function isFull(string key) returns boolean|Error {
         ai:ChatInteractiveMessage[]|Error interactiveMessages = self.getChatInteractiveMessages(key);
-
         if interactiveMessages is Error {
-            error? cause = interactiveMessages.cause();
-            if cause is ExceedsSizeError {
-                return true;
-            }
             return interactiveMessages;
         }
-
         return interactiveMessages.length() >= self.maxMessagesPerKey;
     }
 
@@ -444,10 +452,12 @@ public isolated class ShortTermMemoryStore {
                 createTableResult);
         }
 
+        // Messages are ordered by the monotonically-increasing `id`, not `created_at`, which is
+        // identical for all rows inserted within a single transaction (e.g., a batch insert).
         sql:ExecutionResult|sql:Error createKeyIndexResult = self.dbClient->execute(
             replaceTableNamePlaceholder(
-                `CREATE INDEX IF NOT EXISTS $_tableName_$_key_created_idx
-                    ON $_tableName_$ (message_key, created_at)`,
+                `CREATE INDEX IF NOT EXISTS $_tableName_$_key_id_idx
+                    ON $_tableName_$ (message_key, id)`,
                 self.tableName
             )
         );
@@ -478,7 +488,7 @@ public isolated class ShortTermMemoryStore {
                     SELECT message_json
                     FROM $_tableName_$
                     WHERE message_key = ${key}
-                    ORDER BY created_at ASC`, self.tableName
+                    ORDER BY id ASC`, self.tableName
                 )
             );
             (ai:ChatSystemMessage & readonly)? systemMessage = ();

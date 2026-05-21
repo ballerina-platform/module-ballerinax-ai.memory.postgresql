@@ -24,6 +24,12 @@ const string K1 = "key1";
 const string K2 = "key2";
 const string K3 = "key3";
 
+const string DB_HOST = "localhost";
+const string DB_USER = "postgres";
+const string DB_PASSWORD = "Test-1234#";
+const string DB_NAME = "message_db";
+const string CUSTOM_TABLE = "custom_chat_messages";
+
 const ai:ChatSystemMessage K1SM1 = {role: ai:SYSTEM, content: "You are a helpful assistant that is aware of the weather."};
 
 const ai:ChatUserMessage K1M1 = {role: ai:USER, content: "Hello, my name is Alice. I'm from Seattle."};
@@ -36,12 +42,29 @@ final readonly & ai:ChatAssistantMessage K1M4 = {
 
 const ai:ChatUserMessage K2M1 = {role: ai:USER, content: "Hello, my name is Bob."};
 
+const ai:ChatUserMessage OM1 = {role: ai:USER, content: "overflow message 1"};
+const ai:ChatUserMessage OM2 = {role: ai:USER, content: "overflow message 2"};
+const ai:ChatUserMessage OM3 = {role: ai:USER, content: "overflow message 3"};
+const ai:ChatUserMessage OM4 = {role: ai:USER, content: "overflow message 4"};
+const ai:ChatUserMessage OM5 = {role: ai:USER, content: "overflow message 5"};
+const ai:ChatUserMessage OM6 = {role: ai:USER, content: "overflow message 6"};
+
 isolated postgresql:Client? modCl = ();
 
 @test:BeforeSuite
 function initClient() returns error? {
     lock {
-        modCl = check new (host = "localhost", username = "postgres", password = "Test-1234#", database = "message_db");
+        modCl = check new (host = DB_HOST, username = DB_USER, password = DB_PASSWORD, database = DB_NAME);
+    }
+}
+
+@test:AfterSuite
+function closeClient() returns error? {
+    lock {
+        postgresql:Client? cl = modCl;
+        if cl is postgresql:Client {
+            check cl.close();
+        }
     }
 }
 
@@ -439,7 +462,7 @@ function assertFromDatabase(postgresql:Client cl, string key, ai:ChatMessage[] e
     } else if messageType == INTERACTIVE {
         selectQuery.push(` AND message_role != 'system'`);
     }
-    selectQuery.push(` ORDER BY created_at ASC`);
+    selectQuery.push(` ORDER BY id ASC`);
     stream<DatabaseRecord, error?> databaseRecords = cl->query(sql:queryConcat(...selectQuery));
     ai:ChatMessage[] actualMessages = check toChatMessages(databaseRecords);
     int actualLength = actualMessages.length();
@@ -851,4 +874,339 @@ function testSystemMessageRetrievalDoesNotPopulateCache() returns error? {
 
     // Retrieve all messages - should load from database and include K1M3
     check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2, K1M3]);
+}
+
+function dropCustomTable() returns error? {
+    postgresql:Client cl = getClient();
+    _ = check cl->execute(`DROP TABLE IF EXISTS custom_chat_messages`);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testDatabaseConfigurationConstructor() returns error? {
+    DatabaseConfiguration config = {
+        host: DB_HOST,
+        user: DB_USER,
+        password: DB_PASSWORD,
+        database: DB_NAME
+    };
+    ShortTermMemoryStore store = check new (config);
+
+    check store.put(K1, K1SM1);
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+
+    check assertSystemMessage(store, K1, K1SM1);
+    check assertInteractiveMessages(store, K1, [K1M1, k1m2]);
+    check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2]);
+}
+
+function testInvalidTableName() {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore|Error store = new (cl, tableName = "invalid-table-name");
+    if store !is Error {
+        test:assertFail("Expected an error for an invalid table name");
+    }
+    test:assertTrue(store.message().includes("Invalid table name"));
+}
+
+function testInvalidMaxMessagesPerKey() {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore|Error store = new (cl, 0);
+    if store !is Error {
+        test:assertFail("Expected an error for an invalid 'maxMessagesPerKey'");
+    }
+    test:assertTrue(store.message().includes("maxMessagesPerKey"));
+}
+
+@test:Config {
+    before: dropCustomTable,
+    after: dropCustomTable
+}
+function testCustomTableName() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl, tableName = CUSTOM_TABLE);
+
+    check store.put(K1, K1SM1);
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+
+    check assertSystemMessage(store, K1, K1SM1);
+    check assertInteractiveMessages(store, K1, [K1M1, k1m2]);
+    check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2]);
+
+    // The data must reside in the custom table, not the default one.
+    record {|int count;|} row = check cl->queryRow(
+        `SELECT COUNT(*)::int AS count FROM custom_chat_messages WHERE message_key = ${K1}`);
+    test:assertEquals(row.count, 3);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testCapacityAndIsFull() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl, 3);
+
+    test:assertEquals(store.getCapacity(), 3);
+    test:assertFalse(check store.isFull(K1));
+
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+    test:assertFalse(check store.isFull(K1));
+
+    check store.put(K1, K1M3);
+    test:assertTrue(check store.isFull(K1));
+
+    // The system message does not count towards the interactive-message capacity.
+    check store.put(K1, K1SM1);
+    test:assertTrue(check store.isFull(K1));
+}
+
+@test:Config {
+    before: dropTable
+}
+function testRemoveInteractiveMessagesInvalidCount() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+    check store.put(K1, K1M1);
+
+    Error? zeroResult = store.removeChatInteractiveMessages(K1, 0);
+    test:assertTrue(zeroResult is Error);
+
+    Error? negativeResult = store.removeChatInteractiveMessages(K1, -1);
+    test:assertTrue(negativeResult is Error);
+
+    // The message must remain untouched after the rejected calls.
+    check assertInteractiveMessages(store, K1, [K1M1]);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testPutAllPreservesOrder() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // All interactive messages of one `putAll` are inserted in a single transaction and thus
+    // share a `created_at` value; ordering must remain deterministic regardless.
+    ai:ChatMessage[] batch = [K1SM1, K1M1, k1m2, K1M3, K1M4];
+    check store.put(K1, batch);
+
+    check assertInteractiveMessages(store, K1, [K1M1, k1m2, K1M3, K1M4]);
+    check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2, K1M3, K1M4]);
+    check assertFromDatabase(cl, K1, [K1M1, k1m2, K1M3, K1M4], INTERACTIVE);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testPromptContent() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    string name = "Alice";
+    string city = "Seattle";
+    ai:Prompt prompt = `My name is ${name} and I live in ${city}.`;
+    ai:ChatUserMessage userMessage = {role: ai:USER, content: prompt};
+
+    check store.put(K1, userMessage);
+
+    ai:ChatInteractiveMessage[] messages = check store.getChatInteractiveMessages(K1);
+    test:assertEquals(messages.length(), 1);
+    assertChatMessageEquals(messages[0], userMessage);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testAssistantMessageWithToolCalls() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    ai:ChatAssistantMessage assistantMessage = {
+        role: ai:ASSISTANT,
+        content: (),
+        toolCalls: [{name: "getWeather", arguments: {"city": "Seattle"}, id: "call_1"}]
+    };
+
+    check store.put(K1, assistantMessage);
+
+    ai:ChatInteractiveMessage[] messages = check store.getChatInteractiveMessages(K1);
+    test:assertEquals(messages.length(), 1);
+    assertChatMessageEquals(messages[0], assistantMessage);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testTrimCountEqualAndGreaterThanTotal() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // A count exactly equal to the number of interactive messages removes all of them.
+    check store.put(K1, [K1M1, k1m2]);
+    check store.removeChatInteractiveMessages(K1, 2);
+    check assertInteractiveMessages(store, K1, []);
+    check assertFromDatabase(cl, K1, [], INTERACTIVE);
+
+    // A count greater than the number of interactive messages removes all, without an error.
+    check store.put(K2, K2M1);
+    check store.removeChatInteractiveMessages(K2, 10);
+    check assertInteractiveMessages(store, K2, []);
+    check assertFromDatabase(cl, K2, [], INTERACTIVE);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testTrimCountGreaterThanTotalWithCache() returns error? {
+    postgresql:Client cl = getClient();
+    cache:CacheConfig cacheConfig = {
+        capacity: 10,
+        evictionFactor: 0.2
+    };
+    ShortTermMemoryStore store = check new (cl, cacheConfig = cacheConfig);
+
+    check store.put(K1, K1SM1);
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+
+    // Load the entry into the cache.
+    check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2]);
+
+    // A count exceeding the two interactive messages must drop all of them from the cache too,
+    // while leaving the system message intact.
+    check store.removeChatInteractiveMessages(K1, 5);
+    check assertInteractiveMessages(store, K1, []);
+    check assertSystemMessage(store, K1, K1SM1);
+    check assertAllMessages(store, K1, [K1SM1]);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testTrimOnEmptyKey() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // Trimming a key that has no messages must be a no-op, not an error.
+    check store.removeChatInteractiveMessages(K1);
+    check store.removeChatInteractiveMessages(K1, 3);
+    check assertInteractiveMessages(store, K1, []);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testRepeatedTrimByOne() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // Inserted via `putAll`, so all rows share a `created_at` value; each single-message trim
+    // must still remove the oldest remaining message by insertion order.
+    check store.put(K1, [K1M1, k1m2, K1M3, K1M4]);
+
+    check store.removeChatInteractiveMessages(K1, 1);
+    check assertInteractiveMessages(store, K1, [k1m2, K1M3, K1M4]);
+
+    check store.removeChatInteractiveMessages(K1, 1);
+    check assertInteractiveMessages(store, K1, [K1M3, K1M4]);
+
+    check store.removeChatInteractiveMessages(K1, 1);
+    check assertInteractiveMessages(store, K1, [K1M4]);
+
+    check store.removeChatInteractiveMessages(K1, 1);
+    check assertInteractiveMessages(store, K1, []);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testTrimThenPutCycle() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    check store.put(K1, [K1M1, k1m2, K1M3]);
+
+    // Evict the oldest message, then append a new one - the classic overflow cycle.
+    check store.removeChatInteractiveMessages(K1, 1);
+    check store.put(K1, K1M4);
+    check assertInteractiveMessages(store, K1, [k1m2, K1M3, K1M4]);
+    check assertFromDatabase(cl, K1, [k1m2, K1M3, K1M4], INTERACTIVE);
+
+    check store.removeChatInteractiveMessages(K1, 1);
+    check store.put(K1, K1M1);
+    check assertInteractiveMessages(store, K1, [K1M3, K1M4, K1M1]);
+    check assertFromDatabase(cl, K1, [K1M3, K1M4, K1M1], INTERACTIVE);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testOverflowTrimmingOnUpdate() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl, 3);
+    ai:ShortTermMemory memory = check new (store, {trimCount: 1});
+
+    check memory.update(K1, OM1);
+    check memory.update(K1, OM2);
+    check memory.update(K1, OM3);
+    // Capacity (3) is now reached; each further update must trim the oldest message.
+    check memory.update(K1, OM4);
+    check memory.update(K1, OM5);
+
+    ai:ChatMessage[] fromMemory = check memory.get(K1);
+    test:assertEquals(fromMemory.length(), 3);
+    assertChatMessageEquals(fromMemory[0], OM3);
+    assertChatMessageEquals(fromMemory[1], OM4);
+    assertChatMessageEquals(fromMemory[2], OM5);
+
+    // The store itself must agree with what the memory layer reports.
+    check assertInteractiveMessages(store, K1, [OM3, OM4, OM5]);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testOverflowTrimmingWithTrimCount() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl, 3);
+    ai:ShortTermMemory memory = check new (store, {trimCount: 2});
+
+    check memory.update(K1, OM1);
+    check memory.update(K1, OM2);
+    check memory.update(K1, OM3);
+    // Overflow with `trimCount` 2 removes the two oldest messages each time the limit is hit.
+    check memory.update(K1, OM4);
+    check memory.update(K1, OM5);
+    check memory.update(K1, OM6);
+
+    ai:ChatMessage[] fromMemory = check memory.get(K1);
+    test:assertEquals(fromMemory.length(), 2);
+    assertChatMessageEquals(fromMemory[0], OM5);
+    assertChatMessageEquals(fromMemory[1], OM6);
+
+    check assertInteractiveMessages(store, K1, [OM5, OM6]);
+}
+
+@test:Config {
+    before: dropTable
+}
+function testOverflowTrimmingOnBatchUpdate() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl, 3);
+    ai:ShortTermMemory memory = check new (store, {trimCount: 1});
+
+    // A single batch update larger than the capacity must trim down to the most recent messages.
+    check memory.update(K1, [OM1, OM2, OM3, OM4, OM5]);
+
+    ai:ChatMessage[] fromMemory = check memory.get(K1);
+    test:assertEquals(fromMemory.length(), 3);
+    assertChatMessageEquals(fromMemory[0], OM3);
+    assertChatMessageEquals(fromMemory[1], OM4);
+    assertChatMessageEquals(fromMemory[2], OM5);
+
+    check assertInteractiveMessages(store, K1, [OM3, OM4, OM5]);
 }

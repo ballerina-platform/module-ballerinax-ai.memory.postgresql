@@ -38,12 +38,12 @@ import ballerinax/postgresql;
     import ballerinax/ai.memory.postgresql;
 
     configurable string host = ?;
-    configurable string user = ?;
+    configurable string username = ?;
     configurable string password = ?;
     configurable string database = ?;
 
     ai:ShortTermMemoryStore store = check new postgresql:ShortTermMemoryStore({
-        host, user, password, database
+        host, username, password, database
     });
     ```
 
@@ -55,11 +55,11 @@ import ballerinax/postgresql;
     import ballerinax/ai.memory.postgresql as postgresqlStore;
 
     configurable string host = ?;
-    configurable string user = ?;
+    configurable string username = ?;
     configurable string password = ?;
     configurable string database = ?;
 
-    postgresql:Client postgresqlClient = check new (host = host, username = user, password = password, database = database);
+    postgresql:Client postgresqlClient = check new (host = host, username = username, password = password, database = database);
     ai:ShortTermMemoryStore store = check new postgresqlStore:ShortTermMemoryStore(postgresqlClient);
     ```
 
@@ -69,7 +69,7 @@ import ballerinax/postgresql;
 
     ```ballerina
     ai:ShortTermMemoryStore store = check new postgresql:ShortTermMemoryStore({
-        host, user, password, database
+        host, username, password, database
     }, 10, {capacity: 10});
     ```
 

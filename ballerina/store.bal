@@ -30,7 +30,7 @@ public type Error distinct ai:MemoryError;
 public type DatabaseConfiguration record {|
     # Database host
     string host = "localhost";
-    # Database user
+    # Database username
     string username = "postgres";
     # Database password
     string password?;

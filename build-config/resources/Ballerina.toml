@@ -7,6 +7,7 @@ license = ["Apache-2.0"]
 authors = ["Ballerina"]
 keywords = ["Type/Connector", "Vendor/PostgreSQL", "Area/AI & Machine Learning", "Area/Database", "Type/Short Term Memory Store", "Name/PostgreSQL Memory Store"]
 repository = "https://github.com/ballerina-platform/module-ballerinax-ai.memory.postgresql"
+icon = "icon.png"
 
 [platform.java21]
 graalvmCompatible = true

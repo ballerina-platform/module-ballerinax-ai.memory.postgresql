@@ -250,28 +250,27 @@ public isolated class ShortTermMemoryStore {
         final var [newSystemMessages, newInteractiveMessages] = partitionMessagesByType(messages);
         final readonly & ai:ChatSystemMessage? finalChatSystemMessage = getLatestSystemMessage(newSystemMessages);
 
-        sql:ParameterizedQuery[] insertQueries = from ai:ChatInteractiveMessage msg in newInteractiveMessages
-            let ChatMessageDatabaseMessage dbMsg = transformToDatabaseMessage(msg)
-            select replaceTableNamePlaceholder(`
-                    INSERT INTO $_tableName_$ (message_key, message_role, message_json)
-                    VALUES (${key}, ${dbMsg.role}, ${dbMsg.toJsonString()})`,
-                    self.tableName
-                );
+        // A single upsert template is used for every row. The `ON CONFLICT` clause is a no-op for
+        // interactive rows because they do not satisfy the partial unique index predicate
+        // (`WHERE message_role = 'system'`), so they always insert. The system row, when present,
+        // upserts against the existing one. This lets the whole write go through a single
+        // `batchExecute` round trip with no surrounding transaction.
+        sql:ParameterizedQuery[] insertQueries = [];
+        if finalChatSystemMessage is ai:ChatSystemMessage {
+            insertQueries.push(buildUpsertQuery(self.tableName, key,
+                    transformToDatabaseMessage(finalChatSystemMessage)));
+        }
+        foreach ai:ChatInteractiveMessage msg in newInteractiveMessages {
+            insertQueries.push(buildUpsertQuery(self.tableName, key, transformToDatabaseMessage(msg)));
+        }
 
-        // The system-message upsert and the interactive-message batch insert are wrapped in a single
-        // transaction so the store is never left in a partially-updated state on failure.
-        do {
-            transaction {
-                if finalChatSystemMessage is ai:ChatSystemMessage {
-                    _ = check self.updateSystemMessage(key, transformToDatabaseMessage(finalChatSystemMessage));
-                }
-                if insertQueries.length() > 0 {
-                    _ = check self.dbClient->batchExecute(insertQueries);
-                }
-                check commit;
-            }
-        } on fail error err {
-            return error("Failed to add chat messages: " + err.message(), err);
+        if insertQueries.length() == 0 {
+            return;
+        }
+
+        sql:ExecutionResult[]|sql:Error result = self.dbClient->batchExecute(insertQueries);
+        if result is sql:Error {
+            return error("Failed to add chat messages: " + result.message(), result);
         }
 
         final ai:ChatInteractiveMessage[] & readonly immutableInteractiveMessages = from ai:ChatInteractiveMessage message
@@ -297,15 +296,7 @@ public isolated class ShortTermMemoryStore {
 
     private isolated function updateSystemMessage(string key, ChatMessageDatabaseMessage systemMessage)
         returns sql:ExecutionResult|sql:Error {
-        return self.dbClient->execute(
-            replaceTableNamePlaceholder(`
-                INSERT INTO $_tableName_$ (message_key, message_role, message_json)
-                VALUES (${key}, ${systemMessage.role}, ${systemMessage.toJsonString()})
-                ON CONFLICT (message_key) WHERE message_role = 'system'
-                DO UPDATE SET message_json = EXCLUDED.message_json`,
-                self.tableName
-            )
-        );
+        return self.dbClient->execute(buildUpsertQuery(self.tableName, key, systemMessage));
     }
 
     # Removes the system chat message, if specified, for a given key.
@@ -569,6 +560,16 @@ public isolated class ShortTermMemoryStore {
     public isolated function getCapacity() returns int {
         return self.maxMessagesPerKey;
     }
+}
+
+isolated function buildUpsertQuery(string tableName, string key, ChatMessageDatabaseMessage dbMsg)
+        returns sql:ParameterizedQuery {
+    return replaceTableNamePlaceholder(`
+            INSERT INTO $_tableName_$ (message_key, message_role, message_json)
+            VALUES (${key}, ${dbMsg.role}, ${dbMsg.toJsonString()})
+            ON CONFLICT (message_key) WHERE message_role = 'system'
+            DO UPDATE SET message_json = EXCLUDED.message_json`,
+            tableName);
 }
 
 isolated function replaceTableNamePlaceholder(sql:ParameterizedQuery query, string tableName) returns sql:ParameterizedQuery {

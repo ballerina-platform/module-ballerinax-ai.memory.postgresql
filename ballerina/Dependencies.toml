@@ -147,7 +147,7 @@ dependencies = [
 [[package]]
 org = "ballerina"
 name = "io"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
 	{org = "ballerina", name = "jballerina.java"},
 	{org = "ballerina", name = "lang.value"}
@@ -253,14 +253,6 @@ dependencies = [
 
 [[package]]
 org = "ballerina"
-name = "lang.transaction"
-version = "0.0.0"
-dependencies = [
-	{org = "ballerina", name = "jballerina.java"}
-]
-
-[[package]]
-org = "ballerina"
 name = "lang.value"
 version = "0.0.0"
 dependencies = [
@@ -296,7 +288,7 @@ dependencies = [
 [[package]]
 org = "ballerina"
 name = "mime"
-version = "2.12.1"
+version = "2.12.2"
 dependencies = [
 	{org = "ballerina", name = "io"},
 	{org = "ballerina", name = "jballerina.java"},
@@ -360,7 +352,7 @@ modules = [
 [[package]]
 org = "ballerina"
 name = "task"
-version = "2.11.1"
+version = "2.11.2"
 dependencies = [
 	{org = "ballerina", name = "jballerina.java"},
 	{org = "ballerina", name = "time"},
@@ -430,27 +422,6 @@ dependencies = [
 ]
 
 [[package]]
-org = "ballerinai"
-name = "transaction"
-version = "0.0.0"
-dependencies = [
-	{org = "ballerina", name = "cache"},
-	{org = "ballerina", name = "http"},
-	{org = "ballerina", name = "io"},
-	{org = "ballerina", name = "jballerina.java"},
-	{org = "ballerina", name = "lang.runtime"},
-	{org = "ballerina", name = "lang.transaction"},
-	{org = "ballerina", name = "lang.value"},
-	{org = "ballerina", name = "log"},
-	{org = "ballerina", name = "task"},
-	{org = "ballerina", name = "time"},
-	{org = "ballerina", name = "uuid"}
-]
-modules = [
-	{org = "ballerinai", packageName = "transaction", moduleName = "transaction"}
-]
-
-[[package]]
 org = "ballerinax"
 name = "ai.memory.postgresql"
 version = "1.0.0"
@@ -460,7 +431,6 @@ dependencies = [
 	{org = "ballerina", name = "lang.regexp"},
 	{org = "ballerina", name = "sql"},
 	{org = "ballerina", name = "test"},
-	{org = "ballerinai", name = "transaction"},
 	{org = "ballerinax", name = "postgresql"},
 	{org = "ballerinax", name = "postgresql.driver"}
 ]

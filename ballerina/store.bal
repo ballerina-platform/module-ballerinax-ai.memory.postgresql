@@ -44,6 +44,7 @@ public type DatabaseConfiguration record {|
 |};
 
 # Represents a PostgreSQL-backed short-term memory store for messages.
+@display {label: "PostgreSQL Short Term Memory Store"}
 public isolated class ShortTermMemoryStore {
     *ai:ShortTermMemoryStore;
 

@@ -62,7 +62,7 @@ public isolated class ShortTermMemoryStore {
     # Must start with a letter or underscore and contain only letters, digits, and underscores.
     # Note that PostgreSQL folds unquoted identifiers to lower case.
     # + return - An error if the initialization fails
-    public isolated function init(postgresql:Client|DatabaseConfiguration dbConnection,
+    public isolated function init(@display {label: "Database Connection"} DatabaseConfiguration|postgresql:Client dbConnection,
             int maxMessagesPerKey = 20,
             string tableName = "chat_messages") returns Error? {
         if !regexp:isFullMatch(TABLE_NAME_REGEX, tableName) {

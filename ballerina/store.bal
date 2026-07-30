@@ -26,20 +26,28 @@ final string:RegExp & readonly TABLE_NAME_REGEX = re `^[A-Za-z_][A-Za-z0-9_]*$`;
 public type Error distinct ai:MemoryError;
 
 # Database configuration for the PostgreSQL client.
+@display {label: "Database Configuration"}
 public type DatabaseConfiguration record {|
     # Database host
+    @display {label: "Host"}
     string host = "localhost";
     # Database username
+    @display {label: "Username"}
     string username = "postgres";
     # Database password
+    @display {label: "Password"}
     string password?;
     # Database name
+    @display {label: "Database Name"}
     string database;
     # Database port
+    @display {label: "Port"}
     int port = 5432;
     # Additional options for the PostgreSQL client
+    @display {label: "Options"}
     postgresql:Options options?;
     # Connection pool configuration
+    @display {label: "Connection Pool"}
     sql:ConnectionPool connectionPool?;
 |};
 
@@ -63,8 +71,8 @@ public isolated class ShortTermMemoryStore {
     # Note that PostgreSQL folds unquoted identifiers to lower case.
     # + return - An error if the initialization fails
     public isolated function init(@display {label: "Database Connection"} DatabaseConfiguration|postgresql:Client dbConnection,
-            int maxMessagesPerKey = 20,
-            string tableName = "chat_messages") returns Error? {
+            @display {label: "Max Messages Per Key"} int maxMessagesPerKey = 20,
+            @display {label: "Table Name"} string tableName = "chat_messages") returns Error? {
         if !regexp:isFullMatch(TABLE_NAME_REGEX, tableName) {
             return error(string `Invalid table name: '${tableName}'.`
                 + " Table name must start with a letter or underscore, "

@@ -6,7 +6,6 @@ This module provides a PostgreSQL-backed short-term memory store to use with AI 
 
 - PostgreSQL-backed persistent storage for short-term AI message memory
 - Configurable per-key capacity, surfaced via `getCapacity()` and `isFull()` for the `ai:ShortTermMemory` overflow handler to manage trimming
-- Built-in in-memory caching for improved read performance
 - Support for both direct database configuration and existing PostgreSQL client reuse
 
 ## Prerequisites

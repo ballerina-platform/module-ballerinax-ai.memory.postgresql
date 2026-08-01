@@ -6,7 +6,6 @@ This module provides a PostgreSQL-backed short-term memory store to use with AI 
 
 - PostgreSQL-backed persistent storage for short-term AI message memory
 - Configurable per-key capacity, surfaced via `getCapacity()` and `isFull()` for the `ai:ShortTermMemory` overflow handler to manage trimming
-- Built-in in-memory caching for improved read performance
 - Support for both direct database configuration and existing PostgreSQL client reuse
 
 ## Prerequisites
@@ -64,14 +63,14 @@ import ballerinax/postgresql;
     ai:ShortTermMemoryStore store = check new postgresqlStore:ShortTermMemoryStore(postgresqlClient);
     ```
 
-    Optionally, specify the per-key message capacity (`maxMessagesPerKey` - defaults to `20`), the configuration for the in-memory cache for messages (`cacheConfig` - defaults to no cache), and/or the table name (`tableName` - defaults to `"chat_messages"`).
+    Optionally, specify the per-key message capacity (`maxMessagesPerKey` - defaults to `20`) and/or the table name (`tableName` - defaults to `"chat_messages"`).
 
     > **Note**: `maxMessagesPerKey` is an advisory capacity reported via `getCapacity()`/`isFull()`. The store does not reject messages that exceed it; trimming is performed by the `ai:ShortTermMemory` overflow handler.
 
     ```ballerina
     ai:ShortTermMemoryStore store = check new postgresql:ShortTermMemoryStore({
         host, username, password, database
-    }, 10, {capacity: 10});
+    }, 10);
     ```
 
 > **Note on table naming**: PostgreSQL folds unquoted identifiers to lower case. The default table name `chat_messages` and the validation regex (`^[A-Za-z_][A-Za-z0-9_]*$`) keep things simple — any value supplied via the `tableName` argument is inlined unquoted into SQL and will therefore be lowercased by PostgreSQL.

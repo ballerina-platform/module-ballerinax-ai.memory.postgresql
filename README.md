@@ -63,14 +63,14 @@ import ballerinax/postgresql;
     ai:ShortTermMemoryStore store = check new postgresqlStore:ShortTermMemoryStore(postgresqlClient);
     ```
 
-    Optionally, specify the per-key message capacity (`maxMessagesPerKey` - defaults to `20`), the configuration for the in-memory cache for messages (`cacheConfig` - defaults to no cache), and/or the table name (`tableName` - defaults to `"chat_messages"`).
+    Optionally, specify the per-key message capacity (`maxMessagesPerKey` - defaults to `20`) and/or the table name (`tableName` - defaults to `"chat_messages"`).
 
     > **Note**: `maxMessagesPerKey` is an advisory capacity reported via `getCapacity()`/`isFull()`. The store does not reject messages that exceed it; trimming is performed by the `ai:ShortTermMemory` overflow handler.
 
     ```ballerina
     ai:ShortTermMemoryStore store = check new postgresql:ShortTermMemoryStore({
         host, username, password, database
-    }, 10, {capacity: 10});
+    }, 10);
     ```
 
 > **Note on table naming**: PostgreSQL folds unquoted identifiers to lower case. The default table name `chat_messages` keeps the connector free of identifier-quoting concerns. The `tableName` argument is validated against `^[A-Za-z_][A-Za-z0-9_]*$` and inlined unquoted into SQL — so any upper-case characters in the supplied name will be lowercased by PostgreSQL.

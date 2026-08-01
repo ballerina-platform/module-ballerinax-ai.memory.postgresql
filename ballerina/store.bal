@@ -1,0 +1,467 @@
+// Copyright (c) 2026, WSO2 LLC. (http://www.wso2.com).
+//
+// WSO2 LLC. licenses this file to you under the Apache License,
+// Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+import ballerina/ai;
+import ballerina/sql;
+import ballerinax/postgresql;
+import ballerinax/postgresql.driver as _;
+import ballerina/lang.regexp;
+
+final string:RegExp & readonly TABLE_NAME_REGEX = re `^[A-Za-z_][A-Za-z0-9_]*$`;
+
+# Represents a distinct error type for memory store errors.
+public type Error distinct ai:MemoryError;
+
+# Database configuration for the PostgreSQL client.
+@display {label: "Database Configuration"}
+public type DatabaseConfiguration record {|
+    # Database host
+    @display {label: "Host"}
+    string host = "localhost";
+    # Database username
+    @display {label: "Username"}
+    string username = "postgres";
+    # Database password
+    @display {label: "Password"}
+    string password?;
+    # Database name
+    @display {label: "Database Name"}
+    string database;
+    # Database port
+    @display {label: "Port"}
+    int port = 5432;
+    # Additional options for the PostgreSQL client
+    @display {label: "Options"}
+    postgresql:Options options?;
+    # Connection pool configuration
+    @display {label: "Connection Pool"}
+    sql:ConnectionPool connectionPool?;
+|};
+
+# Represents a PostgreSQL-backed short-term memory store for messages.
+@display {label: "PostgreSQL Short Term Memory Store"}
+public isolated class ShortTermMemoryStore {
+    *ai:ShortTermMemoryStore;
+
+    private final postgresql:Client dbClient;
+    private final int maxMessagesPerKey;
+    private final string tableName;
+    // `true` only if the PostgreSQL client was created internally.
+    private final boolean ownsDbClient;
+
+    # Initializes the PostgreSQL-backed short-term memory store.
+    #
+    # + dbConnection - The PostgreSQL client or database configuration to connect to the database
+    # + maxMessagesPerKey - The maximum number of interactive messages to store per key
+    # + tableName - The name of the database table to store chat messages (default: "chat_messages").
+    # Must start with a letter or underscore and contain only letters, digits, and underscores.
+    # Note that PostgreSQL folds unquoted identifiers to lower case.
+    # + return - An error if the initialization fails
+    public isolated function init(@display {label: "Database Connection"} DatabaseConfiguration|postgresql:Client dbConnection,
+            @display {label: "Max Messages Per Key"} int maxMessagesPerKey = 20,
+            @display {label: "Table Name"} string tableName = "chat_messages") returns Error? {
+        if !regexp:isFullMatch(TABLE_NAME_REGEX, tableName) {
+            return error(string `Invalid table name: '${tableName}'.`
+                + " Table name must start with a letter or underscore, "
+                + "and can only contain letters, digits, and underscores.");
+        }
+        if maxMessagesPerKey < 1 {
+            return error(string `Invalid 'maxMessagesPerKey': ${maxMessagesPerKey}.`
+                + " It must be a positive integer.");
+        }
+        self.tableName = tableName;
+        if dbConnection is postgresql:Client {
+            self.dbClient = dbConnection;
+            self.ownsDbClient = false;
+        } else {
+            postgresql:Client|sql:Error initializedClient = new postgresql:Client(
+                host = dbConnection.host,
+                username = dbConnection.username,
+                password = dbConnection.password,
+                database = dbConnection.database,
+                port = dbConnection.port,
+                options = dbConnection.options,
+                connectionPool = dbConnection.connectionPool
+            );
+            if initializedClient is sql:Error {
+                return error("Failed to create PostgreSQL client: " + initializedClient.message(), initializedClient);
+            }
+            self.dbClient = initializedClient;
+            self.ownsDbClient = true;
+        }
+        self.maxMessagesPerKey = maxMessagesPerKey;
+
+        Error? initResult = self.initializeDatabase();
+        if initResult is Error {
+            // Avoid leaking the connection pool of an internally-created client on init failure.
+            if self.ownsDbClient {
+                sql:Error? closeResult = self.dbClient.close();
+                if closeResult is sql:Error {
+                    // Ignore: surface the original initialization error instead.
+                }
+            }
+            return initResult;
+        }
+    }
+
+    # Retrieves the system message, if it was provided, for a given key.
+    #
+    # + key - The key associated with the memory
+    # + return - A copy of the message if it was specified, nil if it was not, or an
+    # `Error` error if the operation fails
+    public isolated function getChatSystemMessage(string key) returns ai:ChatSystemMessage|Error? {
+        DatabaseRecord|sql:Error systemMessage = self.dbClient->queryRow(
+            replaceTableNamePlaceholder(`
+                SELECT message_json
+                FROM $_tableName_$
+                WHERE message_key = ${key} AND message_role = 'system'`,
+                self.tableName
+            )
+        );
+
+        if systemMessage is sql:NoRowsError {
+            return ();
+        }
+
+        if systemMessage is sql:Error {
+            return error("Failed to retrieve system message: " + systemMessage.message(), systemMessage);
+        }
+
+        ChatSystemMessageDatabaseMessage|error dbMessage = systemMessage.message_json.fromJsonStringWithType();
+        if dbMessage is error {
+            return error("Failed to parse chat message from database: " + dbMessage.message(), dbMessage);
+        }
+
+        return transformFromSystemMessageDatabaseMessage(dbMessage);
+    }
+
+    # Retrieves all stored interactive chat messages (i.e., all chat messages except the system
+    # message) for a given key.
+    #
+    # + key - The key associated with the memory
+    # + return - A copy of the messages, or an `Error` error if the operation fails
+    public isolated function getChatInteractiveMessages(string key) returns ai:ChatInteractiveMessage[]|Error {
+        final var allMessages = check self.getAllFromDatabase(key);
+        if allMessages is readonly & ai:ChatInteractiveMessage[] {
+            return allMessages;
+        }
+        var [_, ...interactiveMessages] = allMessages;
+        return interactiveMessages;
+    }
+
+    # Retrieves all stored chat messages for a given key.
+    #
+    # + key - The key associated with the memory
+    # + return - A copy of the messages, or an `Error` error if the operation fails
+    public isolated function getAll(string key)
+            returns [ai:ChatSystemMessage, ai:ChatInteractiveMessage...]|ai:ChatInteractiveMessage[]|Error {
+        return self.getAllFromDatabase(key);
+    }
+
+    # Adds one or more chat messages to the memory store for a given key.
+    #
+    # + key - The key associated with the memory
+    # + message - The `ChatMessage` message or messages to store
+    # + return - nil on success, or an `Error` if the operation fails
+    public isolated function put(string key, ai:ChatMessage|ai:ChatMessage[] message) returns Error? {
+        if message is ai:ChatMessage[] {
+            return self.putAll(key, message);
+        }
+        ChatMessageDatabaseMessage dbMessage = transformToDatabaseMessage(message);
+        if dbMessage is ChatSystemMessageDatabaseMessage {
+            sql:ExecutionResult|sql:Error upsertResult = self.updateSystemMessage(key, dbMessage);
+            if upsertResult is sql:Error {
+                return error("Failed to upsert system message: " + upsertResult.message(), upsertResult);
+            }
+        } else {
+            do {
+                _ = check self.dbClient->execute(
+                    replaceTableNamePlaceholder(`
+                        INSERT INTO $_tableName_$ (message_key, message_role, message_json)
+                        VALUES (${key}, ${dbMessage.role}, ${dbMessage.toJsonString()})`,
+                        self.tableName
+                    )
+                );
+            } on fail error err {
+                return error("Failed to add chat message: " + err.message(), err);
+            }
+        }
+    }
+
+    private isolated function putAll(string key, ai:ChatMessage[] messages) returns Error? {
+        if messages.length() == 0 {
+            return;
+        }
+
+        final var [newSystemMessages, newInteractiveMessages] = partitionMessagesByType(messages);
+        final ai:ChatSystemMessage? finalChatSystemMessage = getLatestSystemMessage(newSystemMessages);
+
+        // A single upsert template is used for every row. The `ON CONFLICT` clause is a no-op for
+        // interactive rows because they do not satisfy the partial unique index predicate
+        // (`WHERE message_role = 'system'`), so they always insert. The system row, when present,
+        // upserts against the existing one. This lets the whole write go through a single
+        // `batchExecute` round trip with no surrounding transaction.
+        sql:ParameterizedQuery[] insertQueries = [];
+        if finalChatSystemMessage is ai:ChatSystemMessage {
+            insertQueries.push(buildUpsertQuery(self.tableName, key,
+                    transformToDatabaseMessage(finalChatSystemMessage)));
+        }
+        foreach ai:ChatInteractiveMessage msg in newInteractiveMessages {
+            insertQueries.push(buildUpsertQuery(self.tableName, key, transformToDatabaseMessage(msg)));
+        }
+
+        sql:ExecutionResult[]|sql:Error result = self.dbClient->batchExecute(insertQueries);
+        if result is sql:Error {
+            return error("Failed to add chat messages: " + result.message(), result);
+        }
+    }
+
+    private isolated function updateSystemMessage(string key, ChatMessageDatabaseMessage systemMessage)
+        returns sql:ExecutionResult|sql:Error {
+        return self.dbClient->execute(buildUpsertQuery(self.tableName, key, systemMessage));
+    }
+
+    # Removes the system chat message, if specified, for a given key.
+    #
+    # + key - The key associated with the memory
+    # + return - nil on success or if there is no system chat message against the key,
+    # or an `Error` error if the operation fails
+    public isolated function removeChatSystemMessage(string key) returns Error? {
+        sql:ExecutionResult|sql:Error deleteResult = self.dbClient->execute(
+            replaceTableNamePlaceholder(`
+                DELETE FROM $_tableName_$
+                WHERE message_key = ${key} AND message_role = 'system'`,
+                self.tableName
+            )
+        );
+        if deleteResult is sql:Error {
+            return error("Failed to delete existing system message: " + deleteResult.message(), deleteResult);
+        }
+    }
+
+    # Removes all stored interactive chat messages (i.e., all chat messages except the system
+    # message) for a given key.
+    #
+    # + key - The key associated with the memory
+    # + count - Optional number of messages to remove, starting from the first interactive message in;
+    # if not provided, removes all messages
+    # + return - nil on success, or an `Error` error if the operation fails
+    public isolated function removeChatInteractiveMessages(string key, int? count = ()) returns Error? {
+        if count is int && count <= 0 {
+            return error(string `Invalid 'count': ${count}. It must be nil or a positive integer.`);
+        }
+        if count is () {
+            sql:ExecutionResult|sql:Error result = self.dbClient->execute(
+                replaceTableNamePlaceholder(`
+                    DELETE FROM $_tableName_$
+                    WHERE message_key = ${key} AND message_role != 'system'`,
+                    self.tableName
+                )
+            );
+            if result is sql:Error {
+                return error("Failed to delete chat messages: " + result.message(), result);
+            }
+        } else {
+            sql:ExecutionResult|sql:Error result = self.dbClient->execute(
+                replaceTableNamePlaceholder(`
+                    DELETE FROM $_tableName_$
+                    WHERE id IN (
+                        SELECT id
+                        FROM $_tableName_$
+                        WHERE message_key = ${key} AND message_role != 'system'
+                        ORDER BY id ASC
+                        LIMIT ${count}
+                    )`, self.tableName
+                )
+            );
+            if result is sql:Error {
+                return error("Failed to delete chat messages: " + result.message(), result);
+            }
+        }
+    }
+
+    # Removes all stored chat messages for a given key.
+    #
+    # + key - The key associated with the memory
+    # + return - nil on success, or an `Error` error if the operation fails
+    public isolated function removeAll(string key) returns Error? {
+        sql:ExecutionResult|sql:Error result = self.dbClient->execute(
+            replaceTableNamePlaceholder(`
+                DELETE FROM $_tableName_$
+                WHERE message_key = ${key}`,
+                self.tableName
+            )
+        );
+        if result is sql:Error {
+            return error("Failed to delete chat messages: " + result.message(), result);
+        }
+    }
+
+    # Checks if the memory store is full for a given key.
+    #
+    # + key - The key associated with the memory
+    # + return - true if the memory store is full, false otherwise, or an `Error` error if the operation fails
+    public isolated function isFull(string key) returns boolean|Error {
+        // The interactive-message count is obtained via `COUNT(*)` rather than by loading and
+        // deserializing every message, since only the count is needed here.
+        record {|int count;|}|sql:Error countResult = self.dbClient->queryRow(
+            replaceTableNamePlaceholder(`
+                SELECT COUNT(*) AS count
+                FROM $_tableName_$
+                WHERE message_key = ${key} AND message_role != 'system'`,
+                self.tableName
+            )
+        );
+        if countResult is sql:Error {
+            return error("Failed to check if the memory store is full: " + countResult.message(), countResult);
+        }
+        return countResult.count >= self.maxMessagesPerKey;
+    }
+
+    private isolated function initializeDatabase() returns Error? {
+        sql:ExecutionResult|sql:Error createTableResult = self.dbClient->execute(
+            replaceTableNamePlaceholder(
+                `CREATE TABLE IF NOT EXISTS $_tableName_$ (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    message_key TEXT NOT NULL,
+                    message_role TEXT NOT NULL CHECK (message_role IN ('user', 'system', 'assistant', 'function')),
+                    message_json TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )`,
+                self.tableName
+            )
+        );
+        if createTableResult is sql:Error {
+            return error(string `Failed to create ${self.tableName} table: ${createTableResult.message()}`,
+                createTableResult);
+        }
+
+        // Messages are ordered by the monotonically-increasing `id`, not `created_at`, which is
+        // identical for all rows inserted within a single transaction (e.g., a batch insert).
+        sql:ExecutionResult|sql:Error createKeyIndexResult = self.dbClient->execute(
+            replaceTableNamePlaceholder(
+                `CREATE INDEX IF NOT EXISTS $_tableName_$_key_id_idx
+                    ON $_tableName_$ (message_key, id)`,
+                self.tableName
+            )
+        );
+        if createKeyIndexResult is sql:Error {
+            return error(string `Failed to create index on ${self.tableName}: ${createKeyIndexResult.message()}`,
+                createKeyIndexResult);
+        }
+
+        sql:ExecutionResult|sql:Error createSystemIndexResult = self.dbClient->execute(
+            replaceTableNamePlaceholder(
+                `CREATE UNIQUE INDEX IF NOT EXISTS $_tableName_$_system_uidx
+                    ON $_tableName_$ (message_key)
+                    WHERE message_role = 'system'`,
+                self.tableName
+            )
+        );
+        if createSystemIndexResult is sql:Error {
+            return error(string `Failed to create unique index on ${self.tableName}: ${createSystemIndexResult.message()}`,
+                createSystemIndexResult);
+        }
+    }
+
+    private isolated function getAllFromDatabase(string key)
+            returns readonly & ([ai:ChatSystemMessage, ai:ChatInteractiveMessage...]|ai:ChatInteractiveMessage[])|Error {
+        do {
+            stream<DatabaseRecord, sql:Error?> messages = self.dbClient->query(
+                replaceTableNamePlaceholder(`
+                    SELECT message_json
+                    FROM $_tableName_$
+                    WHERE message_key = ${key}
+                    ORDER BY id ASC`, self.tableName
+                )
+            );
+            (ai:ChatSystemMessage & readonly)? systemMessage = ();
+            (ai:ChatInteractiveMessage & readonly)[] interactiveMessages = [];
+
+            // The rows are collected before they are transformed, rather than transformed within a
+            // query action, since returning out of a query action leaves the stream unconsumed.
+            final DatabaseRecord[] databaseRecords = check from DatabaseRecord databaseRecord in messages
+                select databaseRecord;
+
+            foreach DatabaseRecord {message_json} in databaseRecords {
+                ChatMessageDatabaseMessage|error dbMessage = message_json.fromJsonStringWithType();
+                if dbMessage is error {
+                    return error("Failed to parse chat message from database: " + dbMessage.message(), dbMessage);
+                }
+
+                if dbMessage is ChatSystemMessageDatabaseMessage {
+                    systemMessage = transformFromSystemMessageDatabaseMessage(dbMessage);
+                } else {
+                    interactiveMessages.push(transformFromInteractiveMessageDatabaseMessage(
+                            <ChatInteractiveMessageDatabaseMessage>dbMessage));
+                }
+            }
+
+            final ai:ChatInteractiveMessage[] & readonly immutableInteractiveMessages = interactiveMessages.cloneReadOnly();
+            if systemMessage is () {
+                return immutableInteractiveMessages;
+            }
+            return [systemMessage, ...interactiveMessages];
+        } on fail error err {
+            return error("Failed to retrieve chat messages: " + err.message(), err);
+        }
+    }
+
+    # Retrieves the maximum number of interactive messages that can be stored for each key.
+    #
+    # + return - The configured capacity of the message store per key
+    public isolated function getCapacity() returns int {
+        return self.maxMessagesPerKey;
+    }
+}
+
+isolated function buildUpsertQuery(string tableName, string key, ChatMessageDatabaseMessage dbMsg)
+        returns sql:ParameterizedQuery {
+    return replaceTableNamePlaceholder(`
+            INSERT INTO $_tableName_$ (message_key, message_role, message_json)
+            VALUES (${key}, ${dbMsg.role}, ${dbMsg.toJsonString()})
+            ON CONFLICT (message_key) WHERE message_role = 'system'
+            DO UPDATE SET message_json = EXCLUDED.message_json`,
+            tableName);
+}
+
+isolated function replaceTableNamePlaceholder(sql:ParameterizedQuery query, string tableName) returns sql:ParameterizedQuery {
+    final (string[] & readonly) strings = query.strings
+        .'map(value => re `\$_tableName_\$`.replaceAll(value, tableName)).cloneReadOnly();
+    query.strings = strings;
+    return query;
+}
+
+isolated function partitionMessagesByType(ai:ChatMessage[] messages)
+    returns [ai:ChatSystemMessage[], ai:ChatInteractiveMessage[]] {
+    ai:ChatSystemMessage[] systemMsgs = [];
+    ai:ChatInteractiveMessage[] interactiveMsgs = [];
+    foreach ai:ChatMessage msg in messages {
+        if msg is ai:ChatSystemMessage {
+            systemMsgs.push(msg);
+        } else if msg is ai:ChatInteractiveMessage {
+            interactiveMsgs.push(msg);
+        }
+    }
+    return [systemMsgs, interactiveMsgs];
+}
+
+isolated function getLatestSystemMessage(ai:ChatSystemMessage[] systemMessages) returns ai:ChatSystemMessage? {
+    if systemMessages.length() == 0 {
+        return;
+    }
+    return systemMessages[systemMessages.length() - 1];
+}

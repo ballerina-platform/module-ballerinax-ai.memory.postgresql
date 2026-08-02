@@ -451,13 +451,13 @@ public isolated class ShortTermMemoryStore {
     }
 
     private isolated function checkpointTableExists() returns boolean|Error {
-        record {|int count;|}|sql:Error result = self.dbClient->queryRow(
-            `SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_name = ${self.checkpointTableName}`
+        record {|boolean exists;|}|sql:Error result = self.dbClient->queryRow(
+            `SELECT (to_regclass(${self.checkpointTableName}) IS NOT NULL) AS exists`
         );
         if result is sql:Error {
             return error("Failed to check for checkpoint table existence: " + result.message(), result);
         }
-        return result.count > 0;
+        return result.exists;
     }
 
     private isolated function getAllFromDatabase(string key)

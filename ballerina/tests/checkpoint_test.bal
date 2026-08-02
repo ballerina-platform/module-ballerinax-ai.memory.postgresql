@@ -25,7 +25,7 @@ const string SESSION2 = "session2";
 
 function dropCheckpointTable() returns error? {
     postgresql:Client cl = getClient();
-    _ = check cl->execute(`DROP TABLE IF EXISTS chat_message_checkpoints`);
+    _ = check cl->execute(`DROP TABLE IF EXISTS checkpoints`);
     _ = check cl->execute(`DROP TABLE IF EXISTS custom_checkpoints`);
 }
 
@@ -109,7 +109,7 @@ function testCheckpointTableNotCreatedOnInit() returns error? {
 
     record {|int count;|}|sql:Error result = cl->queryRow(
         `SELECT COUNT(*) AS count FROM information_schema.tables
-            WHERE table_name = 'chat_message_checkpoints'`
+            WHERE table_name = 'checkpoints'`
     );
     if result is sql:Error {
         test:assertFail("Failed to query information_schema: " + result.message());
@@ -140,7 +140,7 @@ function testCustomCheckpointTableName() returns error? {
     // The default-named table should not have been touched.
     record {|int count;|}|sql:Error defaultTableCheck = cl->queryRow(
         `SELECT COUNT(*) AS count FROM information_schema.tables
-            WHERE table_name = 'chat_message_checkpoints'`
+            WHERE table_name = 'checkpoints'`
     );
     if defaultTableCheck is sql:Error {
         test:assertFail("Failed to query information_schema: " + defaultTableCheck.message());
@@ -274,7 +274,7 @@ function testRemoveAllDoesNotCreateCheckpointTable() returns error? {
 
     record {|int count;|}|sql:Error result = cl->queryRow(
         `SELECT COUNT(*) AS count FROM information_schema.tables
-            WHERE table_name = 'chat_message_checkpoints'`
+            WHERE table_name = 'checkpoints'`
     );
     if result is sql:Error {
         test:assertFail("Failed to query information_schema: " + result.message());

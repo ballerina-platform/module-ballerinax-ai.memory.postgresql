@@ -150,7 +150,7 @@ public isolated class ShortTermMemoryStore {
         );
 
         if systemMessage is sql:NoRowsError {
-            return ();
+            return;
         }
 
         if systemMessage is sql:Error {
@@ -547,7 +547,7 @@ public isolated class ShortTermMemoryStore {
         );
 
         if checkpointRecord is sql:NoRowsError {
-            return ();
+            return;
         }
         if checkpointRecord is sql:Error {
             return error("Failed to retrieve pending approval: " + checkpointRecord.message(), checkpointRecord);
@@ -594,7 +594,7 @@ public isolated class ShortTermMemoryStore {
         );
 
         if checkpointRecord is sql:NoRowsError {
-            return ();
+            return;
         }
         if checkpointRecord is sql:Error {
             return error("Failed to claim pending approval: " + checkpointRecord.message(), checkpointRecord);

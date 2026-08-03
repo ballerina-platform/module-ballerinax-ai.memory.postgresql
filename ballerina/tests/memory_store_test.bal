@@ -1382,3 +1382,21 @@ function testDatabaseConfigurationWithPortOptionsAndPool() returns error? {
     check assertInteractiveMessages(store, K1, [K1M1, k1m2]);
     check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2]);
 }
+
+@test:Config {}
+function testCheckpointTableNameCollidingWithMessagesTableRejected() {
+    DatabaseConfiguration config = {
+        host: DB_HOST,
+        username: DB_USER,
+        password: DB_PASSWORD,
+        database: DB_NAME,
+        port: DB_PORT,
+        options: {connectTimeout: 10},
+        connectionPool: {maxOpenConnections: 2, maxConnectionLifeTime: 30, minIdleConnections: 1}
+    };
+    ShortTermMemoryStore|Error store = new (config, checkpointTableName = "chat_messages");
+    if store !is Error {
+        test:assertFail("Expected an error when checkpointTableName collides with tableName");
+    }
+    test:assertTrue(store.message().includes("must be different from the chat messages table name"));
+}

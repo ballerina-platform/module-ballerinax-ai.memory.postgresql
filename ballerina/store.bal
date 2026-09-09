@@ -59,25 +59,29 @@ public isolated class ShortTermMemoryStore {
     private final postgresql:Client dbClient;
     private final int maxMessagesPerKey;
     private final string tableName;
+    // Table holding human-in-the-loop pause checkpoints, keyed by session ID. The store never
+    // creates it: schema is the deployment's to provision, and only a deployment that actually uses
+    // human-in-the-loop needs this table at all. The checkpoint operations query it directly, the
+    // same way the message operations query the messages table.
     private final string checkpointTableName;
-    // Set once `ensureCheckpointTable` has confirmed the checkpoint table exists, so later
-    // checkpoint operations skip the `CREATE TABLE IF NOT EXISTS` round trip. Concurrent callers
-    // racing before this is set may each issue the idempotent statement once; that's harmless.
-    private boolean checkpointTableEnsured = false;
     // `true` only if the PostgreSQL client was created internally.
     private final boolean ownsDbClient;
 
     # Initializes the PostgreSQL-backed short-term memory store.
     #
+    # Creating the chat messages table and (if using human-in-the-loop) the checkpoint table
+    # is a pre-requisite. See the [documentation](https://central.ballerina.io/ballerinax/ai.memory.postgresql/latest)
+    # for the required schemas.
+    #
     # + dbConnection - The PostgreSQL client or database configuration to connect to the database
     # + maxMessagesPerKey - The maximum number of interactive messages to store per key
-    # + tableName - The name of the database table to store chat messages (default: "chat_messages").
-    # Must start with a letter or underscore and contain only letters, digits, and underscores.
-    # Note that PostgreSQL folds unquoted identifiers to lower case.
-    # + checkpointTableName - The name of the database table to store human-in-the-loop pause
-    # checkpoints (default: "checkpoints"), created lazily on first use rather than
-    # at initialization. Must start with a letter or underscore and contain only letters, digits,
-    # and underscores. Note that PostgreSQL folds unquoted identifiers to lower case.
+    # + tableName - The name of the database table to store chat messages. Create this table
+    # before use. Must start with a letter or underscore and contain only letters, digits, and
+    # underscores. Note that PostgreSQL folds unquoted identifiers to lower case.
+    # + checkpointTableName - The name of the database table holding human-in-the-loop pause
+    # checkpoints. Create this table before using human-in-the-loop. Must start with a letter or
+    # underscore and contain only letters, digits, and underscores. Note that PostgreSQL folds
+    # unquoted identifiers to lower case.
     # + return - An error if the initialization fails
     public isolated function init(@display {label: "Database Connection"} DatabaseConfiguration|postgresql:Client dbConnection,
             @display {label: "Max Messages Per Key"} int maxMessagesPerKey = 20,
@@ -332,9 +336,9 @@ public isolated class ShortTermMemoryStore {
             return error("Failed to delete chat messages: " + result.message(), result);
         }
 
-        // The checkpoint table is created lazily (see `ensureCheckpointTable`), so `removeAll`
-        // must not force it into existence just to delete a checkpoint that, if the table
-        // doesn't exist yet, cannot possibly be there.
+        // `removeAll` clears a session's messages, so it runs for every deployment, including one
+        // that never uses human-in-the-loop and therefore never provisioned the checkpoint table.
+        // Probe before deleting so those deployments are not failed by a table they do not need.
         boolean|Error checkpointTableExists = self.checkpointTableExists();
         if checkpointTableExists is Error {
             return checkpointTableExists;
@@ -422,38 +426,9 @@ public isolated class ShortTermMemoryStore {
         }
     }
 
-    // Creates the checkpoint table on first use rather than in `initializeDatabase`, so a store
-    // that never exercises human-in-the-loop checkpoints does not pay for a table it never
-    // touches. Skips the round trip entirely once `checkpointTableEnsured` is set; until then,
-    // the statement is idempotent (`IF NOT EXISTS`), so concurrent callers racing to create it
-    // is harmless.
-    private isolated function ensureCheckpointTable() returns Error? {
-        lock {
-            if self.checkpointTableEnsured {
-                return;
-            }
-        }
-
-        sql:ExecutionResult|sql:Error createCheckpointTableResult = self.dbClient->execute(
-            replaceTableNamePlaceholder(
-                `CREATE TABLE IF NOT EXISTS $_tableName_$ (
-                    session_id TEXT PRIMARY KEY,
-                    approval_json TEXT NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )`,
-                self.checkpointTableName
-            )
-        );
-        if createCheckpointTableResult is sql:Error {
-            return error(string `Failed to create ${self.checkpointTableName} table: ${createCheckpointTableResult.message()}`,
-                createCheckpointTableResult);
-        }
-
-        lock {
-            self.checkpointTableEnsured = true;
-        }
-    }
-
+    // Used only by `removeAll`, which runs on the ordinary message path and so must not fail for a
+    // deployment that never provisioned the checkpoint table. The checkpoint operations themselves
+    // query their table directly, exactly as the message operations do.
     private isolated function checkpointTableExists() returns boolean|Error {
         record {|boolean exists;|}|sql:Error result = self.dbClient->queryRow(
             `SELECT (to_regclass(${self.checkpointTableName}) IS NOT NULL) AS exists`
@@ -519,7 +494,6 @@ public isolated class ShortTermMemoryStore {
     # + approval - The pending approval to persist
     # + return - nil on success, or an `Error` if the operation fails
     public isolated function putCheckpoint(ai:PendingApproval approval) returns Error? {
-        check self.ensureCheckpointTable();
         ApprovalDatabaseMessage dbMessage = toApprovalDatabaseMessage(approval);
         sql:ExecutionResult|sql:Error upsertResult = self.dbClient->execute(
             replaceTableNamePlaceholder(`
@@ -540,7 +514,6 @@ public isolated class ShortTermMemoryStore {
     # + sessionId - The session to look up
     # + return - The pending approval, nil if none is pending, or an `Error` if the operation fails
     public isolated function getCheckpoint(string sessionId) returns ai:PendingApproval?|Error {
-        check self.ensureCheckpointTable();
         CheckpointRecord|sql:Error checkpointRecord = self.dbClient->queryRow(
             replaceTableNamePlaceholder(`
                 SELECT approval_json
@@ -569,7 +542,6 @@ public isolated class ShortTermMemoryStore {
     # + sessionId - The session to clear
     # + return - nil on success, or an `Error` if the operation fails
     public isolated function removeCheckpoint(string sessionId) returns Error? {
-        check self.ensureCheckpointTable();
         sql:ExecutionResult|sql:Error result = self.dbClient->execute(
             replaceTableNamePlaceholder(`
                 DELETE FROM $_tableName_$
@@ -587,7 +559,6 @@ public isolated class ShortTermMemoryStore {
     # + sessionId - The session to claim
     # + return - The claimed pending approval, nil if none was pending, or an `Error` if the operation fails
     public isolated function takeCheckpoint(string sessionId) returns ai:PendingApproval?|Error {
-        check self.ensureCheckpointTable();
         CheckpointRecord|sql:Error checkpointRecord = self.dbClient->queryRow(
             replaceTableNamePlaceholder(`
                 DELETE FROM $_tableName_$

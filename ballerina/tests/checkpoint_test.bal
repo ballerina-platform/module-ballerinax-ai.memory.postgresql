@@ -29,6 +29,23 @@ function dropCheckpointTable() returns error? {
     _ = check cl->execute(`DROP TABLE IF EXISTS custom_checkpoints`);
 }
 
+// The checkpoint table schema. The store never creates this table; a deployment provisions it, so
+// tests that exercise checkpoint operations must stand in for that deployment.
+final sql:ParameterizedQuery createCheckpointTableQuery = `
+    CREATE TABLE checkpoints (
+        session_id TEXT PRIMARY KEY,
+        approval_json TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`;
+
+// `before` hook for tests that exercise checkpoint operations: clean slate, plus the
+// deployment-provisioned checkpoint table those operations require.
+function dropCheckpointTableAndProvision() returns error? {
+    check dropCheckpointTable();
+    postgresql:Client cl = getClient();
+    _ = check cl->execute(createCheckpointTableQuery);
+}
+
 function buildPendingApproval(string sessionId) returns ai:PendingApproval {
     time:Utc now = time:utcNow();
     return {
@@ -123,19 +140,17 @@ function testCheckpointTableNotCreatedOnInit() returns error? {
 }
 function testCustomCheckpointTableName() returns error? {
     postgresql:Client cl = getClient();
+    _ = check cl->execute(`
+        CREATE TABLE custom_checkpoints (
+            session_id TEXT PRIMARY KEY,
+            approval_json TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`);
+
     ShortTermMemoryStore store = check new (cl, checkpointTableName = "custom_checkpoints");
 
     ai:PendingApproval approval = buildPendingApproval(SESSION1);
     check store.putCheckpoint(approval);
-
-    record {|int count;|}|sql:Error tableCheck = cl->queryRow(
-        `SELECT COUNT(*) AS count FROM information_schema.tables
-            WHERE table_name = 'custom_checkpoints'`
-    );
-    if tableCheck is sql:Error {
-        test:assertFail("Failed to query information_schema: " + tableCheck.message());
-    }
-    test:assertEquals(tableCheck.count, 1, "Expected the custom checkpoint table to be created");
 
     // The default-named table should not have been touched.
     record {|int count;|}|sql:Error defaultTableCheck = cl->queryRow(
@@ -165,7 +180,7 @@ function testInvalidCheckpointTableName() {
 }
 
 @test:Config {
-    before: dropCheckpointTable
+    before: dropCheckpointTableAndProvision
 }
 function testPutAndGetCheckpoint() returns error? {
     postgresql:Client cl = getClient();
@@ -187,7 +202,7 @@ function testPutAndGetCheckpoint() returns error? {
 }
 
 @test:Config {
-    before: dropCheckpointTable
+    before: dropCheckpointTableAndProvision
 }
 function testPutCheckpointReplacesExisting() returns error? {
     postgresql:Client cl = getClient();
@@ -208,7 +223,7 @@ function testPutCheckpointReplacesExisting() returns error? {
 }
 
 @test:Config {
-    before: dropCheckpointTable
+    before: dropCheckpointTableAndProvision
 }
 function testRemoveCheckpoint() returns error? {
     postgresql:Client cl = getClient();
@@ -223,7 +238,7 @@ function testRemoveCheckpoint() returns error? {
 }
 
 @test:Config {
-    before: dropCheckpointTable
+    before: dropCheckpointTableAndProvision
 }
 function testTakeCheckpoint() returns error? {
     postgresql:Client cl = getClient();
@@ -246,7 +261,7 @@ function testTakeCheckpoint() returns error? {
 }
 
 @test:Config {
-    before: dropCheckpointTable
+    before: dropCheckpointTableAndProvision
 }
 function testRemoveAllAlsoClearsCheckpoint() returns error? {
     postgresql:Client cl = getClient();
@@ -281,4 +296,72 @@ function testRemoveAllDoesNotCreateCheckpointTable() returns error? {
     }
     test:assertEquals(result.count, 0,
             "removeAll should not create the checkpoint table when it does not already exist");
+}
+
+@test:Config {
+    before: dropCheckpointTable
+}
+function testStoreNeverCreatesCheckpointTable() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // Nothing the store does creates the checkpoint table: not initialization, not the message
+    // operations, and not `removeAll`, which touches the checkpoint table when it exists.
+    check store.put(SESSION1, K1SM1);
+    check store.put(SESSION1, K1M1);
+    _ = check store.getAll(SESSION1);
+    check store.removeAll(SESSION1);
+
+    record {|int count;|}|sql:Error result = cl->queryRow(
+        `SELECT COUNT(*) AS count FROM information_schema.tables
+            WHERE table_name = 'checkpoints'`
+    );
+    if result is sql:Error {
+        test:assertFail("Failed to query information_schema: " + result.message());
+    }
+    test:assertEquals(result.count, 0, "The store must never create the checkpoint table");
+}
+
+@test:Config {
+    before: dropCheckpointTable
+}
+function testCheckpointOperationsFailWithoutTable() returns error? {
+    postgresql:Client cl = getClient();
+    ShortTermMemoryStore store = check new (cl);
+
+    // The checkpoint table is the deployment's to provision. If it is missing, every checkpoint
+    // operation surfaces the database's own error naming the table, rather than silently creating
+    // it or pretending nothing is pending.
+    ai:PendingApproval?|Error read = store.getCheckpoint(SESSION1);
+    if read !is Error {
+        test:assertFail("Expected an error when reading a checkpoint without a checkpoint table");
+    }
+    test:assertTrue(read.message().includes("checkpoints"), read.message());
+
+    Error? written = store.putCheckpoint(buildPendingApproval(SESSION1));
+    if written !is Error {
+        test:assertFail("Expected an error when persisting a checkpoint without a checkpoint table");
+    }
+    test:assertTrue(written.message().includes("checkpoints"), written.message());
+
+    ai:PendingApproval?|Error claimed = store.takeCheckpoint(SESSION1);
+    if claimed !is Error {
+        test:assertFail("Expected an error when claiming a checkpoint without a checkpoint table");
+    }
+    test:assertTrue(claimed.message().includes("checkpoints"), claimed.message());
+
+    Error? removed = store.removeCheckpoint(SESSION1);
+    if removed !is Error {
+        test:assertFail("Expected an error when removing a checkpoint without a checkpoint table");
+    }
+    test:assertTrue(removed.message().includes("checkpoints"), removed.message());
+
+    record {|int count;|}|sql:Error result = cl->queryRow(
+        `SELECT COUNT(*) AS count FROM information_schema.tables
+            WHERE table_name = 'checkpoints'`
+    );
+    if result is sql:Error {
+        test:assertFail("Failed to query information_schema: " + result.message());
+    }
+    test:assertEquals(result.count, 0, "A failed checkpoint operation must not create the table");
 }
